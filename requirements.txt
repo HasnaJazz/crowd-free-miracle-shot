@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 streamlit>=1.36
 opencv-python>=4.8
 numpy>=1.24,<2.0
@@ -6,5 +7,5 @@ pandas>=2.0
 phonenumbers>=8.13
 ultralytics>=8.1
 simple-lama-inpainting>=0.1.1,<0.2
-torch==2.3.1+cpu @ https://download.pytorch.org/whl/cpu/torch-2.3.1%2Bcpu-cp311-cp311-linux_x86_64.whl
-torchvision==0.18.1+cpu @ https://download.pytorch.org/whl/cpu/torchvision-0.18.1%2Bcpu-cp311-cp311-linux_x86_64.whl
+torch==2.3.1+cpu
+torchvision==0.18.1+cpu
