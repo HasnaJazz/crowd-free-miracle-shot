@@ -78,7 +78,18 @@ def _feather_blend(original, inpainted_upscaled, mask):
                    + inpainted_upscaled.astype(np.float32) * mask, 0, 255).astype(np.uint8)
 
 
-def remove_people(img_bgr, max_dim=None, dilate_px=6):
+def remove_people(img_bgr, max_dim=None, dilate_px=6, remove_all=False, keep_ratio=0.25):
+    """
+    Remove *background* people while keeping the main subject(s) of the photo.
+
+    The visitor is the subject (large, in the foreground). Background strangers
+    are smaller / further away. So we keep the people whose mask is large enough
+    relative to the biggest person, and only erase the smaller ones.
+
+    remove_all=True  -> erase every person (empty the scene).
+    keep_ratio       -> a person is 'background' if its mask area < keep_ratio
+                        x the largest person's area. Higher = removes more.
+    """
     max_dim = max_dim or MAX_DIM
     t0 = time.time()
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -86,18 +97,32 @@ def remove_people(img_bgr, max_dim=None, dilate_px=6):
 
     model = _load_yolo()
     res = model.predict(rgb, conf=0.35, verbose=False)[0]
-    person_mask = np.zeros((H, W), np.uint8)
-    people = 0
+
+    # Collect each detected person's full-res mask + area
+    people = []  # (area, mask_uint8)
     if res.masks is not None and res.boxes is not None:
         cls = res.boxes.cls.cpu().numpy().astype(int)
         mdata = res.masks.data.cpu().numpy()
         names = res.names
         for i, c in enumerate(cls):
             if names.get(c) == "person":
-                people += 1
                 m = cv2.resize(mdata[i].astype(np.uint8) * 255, (W, H),
                                interpolation=cv2.INTER_LINEAR)
+                people.append((int((m > 0).sum()), m))
+
+    # Decide which people to erase
+    person_mask = np.zeros((H, W), np.uint8)
+    removed = 0
+    kept = 0
+    if people:
+        largest = max(a for a, _ in people)
+        for area, m in people:
+            if remove_all or area < keep_ratio * largest:
                 person_mask = np.maximum(person_mask, m)
+                removed += 1
+            else:
+                kept += 1
+    total_people = len(people)
     mask_px = int((person_mask > 0).sum())
     if mask_px > 0 and dilate_px > 0:
         k = max(3, int(dilate_px))
@@ -106,7 +131,7 @@ def remove_people(img_bgr, max_dim=None, dilate_px=6):
 
     cleaned = img_bgr.copy()
     t_inpaint = 0.0
-    if people > 0 and mask_px > 0:
+    if removed > 0 and mask_px > 0:
         rgb_s, mask_s = _downscale(rgb, person_mask, max_dim)
         t1 = time.time()
         out_s = np.array(_load_lama()(Image.fromarray(rgb_s), Image.fromarray(mask_s)))
@@ -115,7 +140,8 @@ def remove_people(img_bgr, max_dim=None, dilate_px=6):
                               interpolation=cv2.INTER_CUBIC)
         cleaned = _feather_blend(img_bgr, out_full, person_mask)
 
-    return {"cleaned_bgr": cleaned, "people_count": people, "mask_px": mask_px,
+    return {"cleaned_bgr": cleaned, "people_count": removed, "kept": kept,
+            "total_people": total_people, "mask_px": mask_px,
             "timings": {"detect": round(t_detect, 2), "inpaint": round(t_inpaint, 2),
                         "total": round(time.time() - t0, 2)}}
 
@@ -135,11 +161,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 st.markdown('<div class="big">🌸 Crowd-Free Miracle Shot</div>', unsafe_allow_html=True)
-st.markdown('<span class="muted">After-sale AI add-on — erase every background person '
-            'and keep your perfect garden shot.</span>', unsafe_allow_html=True)
+st.markdown('<span class="muted">Erase the strangers in the <b>background</b> of your garden '
+            'photo — while keeping <b>you</b> as the main subject.</span>', unsafe_allow_html=True)
 st.markdown('<span class="badge">Free self-hosted AI</span>'
             '<span class="badge">YOLOv8 + LaMa</span>'
-            '<span class="badge">No API key</span>', unsafe_allow_html=True)
+            '<span class="badge">Keeps you in the shot</span>', unsafe_allow_html=True)
 
 
 @st.cache_resource
@@ -147,7 +173,8 @@ def data_path():
     p = Path("data") / "entries.csv"
     p.parent.mkdir(exist_ok=True)
     if not p.exists():
-        p.write_text("id,timestamp,name,whatsapp,country_code,email,market,consent,people_removed\n")
+        p.write_text("id,timestamp,name,whatsapp,country_code,email,market,"
+                     "opt_feature,opt_draw,people_removed\n")
     return str(p)
 
 
@@ -156,20 +183,32 @@ def append_entry(rec):
         csv.DictWriter(f, fieldnames=list(rec.keys())).writerow(rec)
 
 
-def validate_phone(v):
-    v = v.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+def normalize_phone(v):
+    """Return E.164 string, or raise ValueError with a helpful message.
+    Accepts full international (+CC...) OR UAE-style local numbers
+    (05x..., 0xx...) without a country code."""
+    v = v.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace(".", "")
     if not v:
-        return "Please enter your phone number."
-    if not v.startswith("+"):
-        return "Include your country code, e.g. +971 50 123 4567."
-    try:
-        num = phonenumbers.parse(v, None)
-    except phonenumbers.NumberParseException:
-        return "That number doesn't look right."
-    if not phonenumbers.is_valid_number(num):
-        return (f"Invalid number "
-                f"({phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.INTERNATIONAL)}).")
-    return None
+        raise ValueError("Please enter your phone number.")
+    if v.startswith("+"):
+        try:
+            num = phonenumbers.parse(v, None)
+        except phonenumbers.NumberParseException:
+            raise ValueError("That number doesn't look right. Check the digits.")
+        if not phonenumbers.is_valid_number(num):
+            raise ValueError(f"Invalid number ({phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.INTERNATIONAL)}). "
+                             "Please check the digits and country code.")
+        return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+    else:
+        # No country code given -> try to interpret as a UAE number (most visitors)
+        try:
+            num = phonenumbers.parse(v, "AE")
+        except phonenumbers.NumberParseException:
+            raise ValueError("For non-UAE numbers include your country code, e.g. +44 7911 123456.")
+        if phonenumbers.is_valid_number(num):
+            return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+        raise ValueError("That number doesn't look right. For UAE use e.g. 050 123 4567; "
+                         "otherwise include your country code (+...).")
 
 
 uploaded = st.file_uploader("📷 Upload your garden photo (JPG/PNG)", type=["jpg", "jpeg", "png"])
@@ -182,11 +221,17 @@ with tab_v:
         market = c2.selectbox("Visiting from", ["UAE resident", "Saudi Arabia", "India",
                                                 "United Kingdom", "Russia / CIS", "Germany",
                                                 "US / Canada", "Morocco", "Other international"])
-        ph = st.text_input("Phone (international)", placeholder="+971 50 123 4567")
+        ph = st.text_input("Phone", placeholder="e.g. 050 123 4567  or  +44 7911 123456")
         email = st.text_input("Email (optional)", placeholder="you@email.com")
-        consent = st.checkbox("I agree Dubai Miracle Garden may store my contact for the draw "
-                              "and future seasons, and may feature my cleaned photo "
-                              "(UAE PDPL consent; opt-out anytime).", value=True)
+        st.markdown("#### Optional — how would you like to join in?")
+        opt_feature = st.checkbox("🌸 Yes — you may feature my photo on the official garden "
+                                  "social channels.")
+        opt_draw = st.checkbox("🏆 Yes — enter my contact details into the 19:00 Daily Bloom "
+                               "Draw for a chance to win.")
+        remove_all = st.checkbox("Remove ALL people (empty the scene) — I want a completely "
+                                 "empty garden shot.",
+                                 help="Leave this OFF to keep you/your group as the main subject "
+                                      "and only remove background strangers.", value=False)
         go = st.form_submit_button("✨ Remove people from my photo", type="primary",
                                    use_container_width=True)
 
@@ -199,11 +244,12 @@ with tab_v:
             errs.append("Please upload a photo first.")
         if not name.strip():
             errs.append("Please add your first name.")
-        werr = validate_phone(ph)
-        if werr:
-            errs.append(werr)
+        try:
+            wa = normalize_phone(ph)
+        except ValueError as ex:
+            errs.append(str(ex))
         if email.strip() and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email.strip()):
-            errs.append("That email doesn't look valid.")
+            errs.append("That email doesn't look valid (you can leave it blank).")
         if errs:
             for e in errs:
                 st.error(e)
@@ -213,42 +259,57 @@ with tab_v:
             if img_bgr is None:
                 st.error("Could not read that image. Try a JPG or PNG.")
             else:
-                parsed = phonenumbers.parse(ph.replace(" ", "").replace("-", ""), None)
+                parsed = phonenumbers.parse(wa, None)
                 append_entry({
                     "id": str(int(time.time())),
                     "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "name": name.strip(),
-                    "whatsapp": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164),
+                    "whatsapp": wa,
                     "country_code": "+" + str(parsed.country_code),
                     "email": email.strip().lower(),
                     "market": market,
-                    "consent": "yes" if consent else "no",
+                    "opt_feature": "yes" if opt_feature else "no",
+                    "opt_draw": "yes" if opt_draw else "no",
                     "people_removed": 0,
                 })
-                with st.spinner("AI is removing the crowd… ~10s on CPU (first run downloads models)."):
+                with st.spinner("AI is removing the background crowd… ~10s on CPU (first run downloads models)."):
                     try:
-                        r = remove_people(img_bgr)
+                        r = remove_people(img_bgr, remove_all=remove_all)
                     except Exception as ex:
                         st.error(f"AI error: {ex}")
                         st.stop()
                 ca, cb = st.columns(2)
                 ca.image(img_bgr[:, :, ::-1], caption="Original", use_container_width=True)
-                cb.image(r["cleaned_bgr"][:, :, ::-1], caption=f"Crowd-free ✨ ({r['people_count']} removed)",
+                removed_txt = "ALL people" if remove_all else "background people"
+                cb.image(r["cleaned_bgr"][:, :, ::-1],
+                         caption=f"Crowd-free ✨ ({r['people_count']} {removed_txt} removed)",
                          use_container_width=True)
                 m1, m2, m3 = st.columns(3)
-                m1.markdown(f'<div class="stat"><b>{r["people_count"]}</b>people removed</div>', unsafe_allow_html=True)
-                m2.markdown(f'<div class="stat"><b>{r["timings"]["total"]}s</b>AI time</div>', unsafe_allow_html=True)
+                m1.markdown(f'<div class="stat"><b>{r["people_count"]}</b>{removed_txt} removed</div>',
+                            unsafe_allow_html=True)
+                if not remove_all:
+                    m2.markdown(f'<div class="stat"><b>{r["kept"]}</b>subject kept</div>',
+                                unsafe_allow_html=True)
+                else:
+                    m2.markdown(f'<div class="stat"><b>{r["timings"]["total"]}s</b>AI time</div>',
+                                unsafe_allow_html=True)
                 m3.markdown('<div class="stat"><b>$0</b>per photo</div>', unsafe_allow_html=True)
                 ok, buf = cv2.imencode(".jpg", r["cleaned_bgr"], [cv2.IMWRITE_JPEG_QUALITY, 90])
                 if ok:
                     st.download_button("⬇ Download crowd-free photo", buf.tobytes(),
                                        file_name="my-crowdfree-miracle-shot.jpg",
                                        mime="image/jpeg", use_container_width=True)
-                st.success(f"✨ Done, {name.strip()}! {r['people_count']} background person(s) "
-                           f"removed. Tag #MyMiracleMoment and enter the Daily Bloom Draw at 19:00.")
+                if remove_all:
+                    st.success(f"✨ Done, {name.strip()}! Empty-garden shot ready. "
+                               f"Tag #MyMiracleMoment.")
+                else:
+                    st.success(f"✨ Done, {name.strip()}! Removed {r['people_count']} background "
+                               f"person(s) and kept you/your group as the main subject. "
+                               f"Tag #MyMiracleMoment.")
 
 with tab_o:
-    st.caption("Consented contacts captured by this after-sale add-on.")
+    st.caption("Contacts captured by this after-sale add-on — incl. who opted in to be "
+               "featured on social (opt_feature) and who entered the draw (opt_draw).")
     try:
         import pandas as pd
         df = pd.read_csv(data_path())
